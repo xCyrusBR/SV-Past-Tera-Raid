@@ -1,0 +1,10 @@
+# Related projects reviewed (2026-09-28)
+
+| Project | What it provides | Relevance to the synthetic host |
+| --- | --- | --- |
+| [Event-Raid-Injector](https://github.com/Insektaure/Event-Raid-Injector) | Injects past raid-event blocks into a Scarlet/Violet save on a CFW Switch; requires a modified console. | Useful for the Mewtwo event/save reference, not for admitting an unmodified Violet guest or fixing live lobby slots. A copy already exists in the private workspace. |
+| [Tera-Finder](https://github.com/Manu098vm/Tera-Finder) | Views/edits raid and outbreak data, imports Poké Portal News and changes raid flags. | Useful for validating event data and save state; it does not implement a local LDN raid host. |
+| [SVRaidBot](https://github.com/hexbyt3/SVRaidBot) | Automates raid hosting on a running Scarlet/Violet game and can select event raids and the bot's party Pokémon. | Useful as a behavioral reference for a real host's raid flow, but its host is the game/console, not a replacement implementation of the local wireless game protocol. |
+| [Ryujinx LDN guide](https://git.blizzard.systems/github-mirrors/ryujinx/wiki/Multiplayer-%28LDN-Local-Wireless%29-Guide) | Explains emulator-to-emulator RyuLDN and `ldn_mitm` with a CFW Switch. | Useful for the separate emulator-bridge research. It does not directly connect an unmodified Switch to a synthetic host; our physical-radio ESP32-S3 route remains necessary. |
+
+The next technical focus remains the two-station player/slot mapping. PR is the only synthetic trainer and must occupy the host seat with Mew. Evan belongs to the Scarlet save/reference; the physical Violet guest is a separate trainer and should occupy the second seat with their own selected Pokémon. The other two battle positions should be created by the game as NPCs once it accepts a valid two-player raid. No current evidence supports injecting Evan or two additional fake players. These projects help validate event data or real-host behavior but do not resolve the missing synthetic-host game-state messages by themselves.
