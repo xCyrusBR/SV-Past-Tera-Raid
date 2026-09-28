@@ -1,0 +1,355 @@
+#include "injector.h"
+#include <fstream>
+#include <sys/stat.h>
+#include <cstring>
+
+namespace Injector {
+
+// Version suffixes to try, in order (newest first)
+static const char* VERSION_SUFFIXES[] = { "_3_0_0", "_2_0_0", "_1_3_0", "" };
+static constexpr int NUM_SUFFIXES = 4;
+
+static bool fileExists(const std::string& path) {
+    struct stat st;
+    return stat(path.c_str(), &st) == 0 && S_ISREG(st.st_mode);
+}
+
+// Try to find a file with version fallback. Returns full path or empty string.
+static std::string findVersionedFile(const std::string& dir, const char* baseName) {
+    for (int i = 0; i < NUM_SUFFIXES; i++) {
+        std::string path = dir + baseName + VERSION_SUFFIXES[i];
+        if (fileExists(path))
+            return path;
+    }
+    return "";
+}
+
+static std::vector<uint8_t> readBinaryFile(const std::string& path) {
+    std::ifstream file(path, std::ios::binary | std::ios::ate);
+    if (!file.is_open())
+        return {};
+
+    auto size = file.tellg();
+    file.seekg(0);
+
+    std::vector<uint8_t> data(size);
+    file.read(reinterpret_cast<char*>(data.data()), size);
+    return data;
+}
+
+static std::string readTextFile(const std::string& path) {
+    std::ifstream file(path);
+    if (!file.is_open())
+        return "";
+
+    std::string content;
+    std::getline(file, content);
+    // Trim trailing whitespace/newlines
+    while (!content.empty() && (content.back() == '\r' || content.back() == '\n' || content.back() == ' '))
+        content.pop_back();
+    return content;
+}
+
+bool isValidOutbreakFolder(const std::string& path) {
+    if (!fileExists(path + "Identifier.txt"))
+        return false;
+
+    std::string filesDir = path + "Files/";
+
+    // Required: pokedata + Paldea + Kitakami zones (Outbreaks BCAT shipped in 2.0.0)
+    if (findVersionedFile(filesDir, "pokedata_array").empty())
+        return false;
+    if (findVersionedFile(filesDir, "zone_main_array").empty())
+        return false;
+    if (findVersionedFile(filesDir, "zone_su1_array").empty())
+        return false;
+    // zone_su2_array (Blueberry) is optional, only present in 3.0.0+ events.
+
+    return true;
+}
+
+bool isValidRaidFolder(const std::string& path) {
+    // Check Identifier.txt
+    if (!fileExists(path + "Identifier.txt"))
+        return false;
+
+    std::string filesDir = path + "Files/";
+
+    // Check all 5 required binary files (with version fallback)
+    if (findVersionedFile(filesDir, "event_raid_identifier").empty())
+        return false;
+    if (findVersionedFile(filesDir, "raid_enemy_array").empty())
+        return false;
+    if (findVersionedFile(filesDir, "fixed_reward_item_array").empty())
+        return false;
+    if (findVersionedFile(filesDir, "lottery_reward_item_array").empty())
+        return false;
+    if (findVersionedFile(filesDir, "raid_priority_array").empty())
+        return false;
+
+    return true;
+}
+
+InjectorResult injectRaidEvent(SaveFile& save, const std::string& folderPath) {
+    InjectorResult result{};
+
+    if (!save.isLoaded()) {
+        result.message = "Save file not loaded";
+        return result;
+    }
+
+    // Ensure trailing slash
+    std::string path = folderPath;
+    if (!path.empty() && path.back() != '/')
+        path += '/';
+
+    // Read identifier
+    result.identifier = readTextFile(path + "Identifier.txt");
+    if (result.identifier.empty()) {
+        result.message = "Failed to read Identifier.txt";
+        return result;
+    }
+
+    std::string filesDir = path + "Files/";
+
+    // Find and read all binary files with version fallback
+    struct FileSpec {
+        const char* baseName;
+        uint32_t blockKey;
+    };
+    static const FileSpec specs[] = {
+        { "event_raid_identifier",    KEY_RAID_IDENTIFIER },
+        { "raid_enemy_array",         KEY_RAID_ENEMY_ARRAY },
+        { "fixed_reward_item_array",  KEY_FIXED_REWARD_ARRAY },
+        { "lottery_reward_item_array", KEY_LOTTERY_REWARD_ARRAY },
+        { "raid_priority_array",      KEY_RAID_PRIORITY_ARRAY },
+    };
+
+    for (const auto& spec : specs) {
+        std::string filePath = findVersionedFile(filesDir, spec.baseName);
+        if (filePath.empty()) {
+            result.message = std::string("Missing file: ") + spec.baseName;
+            return result;
+        }
+
+        std::vector<uint8_t> data = readBinaryFile(filePath);
+        if (data.empty()) {
+            result.message = std::string("Failed to read: ") + spec.baseName;
+            return result;
+        }
+
+        if (!save.replaceBlockData(spec.blockKey, data)) {
+            result.message = std::string("Failed to inject block: ") + spec.baseName;
+            return result;
+        }
+    }
+
+    result.success = true;
+    result.message = "Successfully imported event [" + result.identifier + "]";
+    return result;
+}
+
+InjectorResult injectOutbreakEvent(SaveFile& save, const std::string& folderPath) {
+    InjectorResult result{};
+
+    if (!save.isLoaded()) {
+        result.message = "Save file not loaded";
+        return result;
+    }
+
+    std::string path = folderPath;
+    if (!path.empty() && path.back() != '/')
+        path += '/';
+
+    result.identifier = readTextFile(path + "Identifier.txt");
+    if (result.identifier.empty()) {
+        result.message = "Failed to read Identifier.txt";
+        return result;
+    }
+
+    std::string filesDir = path + "Files/";
+
+    // Required blocks: pokedata, Paldea zones, Kitakami zones.
+    struct FileSpec {
+        const char* baseName;
+        uint32_t blockKey;
+        bool required;
+    };
+    static const FileSpec specs[] = {
+        { "pokedata_array",  KEY_OUTBREAK_POKEDATA,        true  },
+        { "zone_main_array", KEY_OUTBREAK_ZONES_PALDEA,    true  },
+        { "zone_su1_array",  KEY_OUTBREAK_ZONES_KITAKAMI,  true  },
+        { "zone_su2_array",  KEY_OUTBREAK_ZONES_BLUEBERRY, false },
+    };
+
+    for (const auto& spec : specs) {
+        std::string filePath = findVersionedFile(filesDir, spec.baseName);
+        if (filePath.empty()) {
+            if (!spec.required)
+                continue;
+            result.message = std::string("Missing file: ") + spec.baseName;
+            return result;
+        }
+
+        std::vector<uint8_t> data = readBinaryFile(filePath);
+        if (data.empty()) {
+            result.message = std::string("Failed to read: ") + spec.baseName;
+            return result;
+        }
+
+        // Match Tera-Finder FinalizeImportOutbreak: skip blocks whose Type is None
+        // (or absent). Creating new blocks would change the encrypted file size,
+        // which is unsafe on the Switch journaled save filesystem.
+        SCBlock* block = save.findBlock(spec.blockKey);
+        if (!block || block->type == SCTypeCode::None)
+            continue;
+
+        if (!save.replaceBlockData(spec.blockKey, data)) {
+            result.message = std::string("Failed to inject block: ") + spec.baseName;
+            return result;
+        }
+    }
+
+    // Enable the BCAT outbreak event flag. Tera-Finder only flips it if it
+    // currently exists with a non-None type — preserve that behavior.
+    SCBlock* enabled = save.findBlock(KEY_OUTBREAK_ENABLED);
+    if (enabled && enabled->type != SCTypeCode::None) {
+        if (!save.setBoolBlock(KEY_OUTBREAK_ENABLED, true)) {
+            result.message = "Failed to enable outbreak event flag";
+            return result;
+        }
+    }
+
+    result.success = true;
+    result.message = "Successfully imported outbreak event [" + result.identifier + "]";
+    return result;
+}
+
+InjectorResult injectNullEvent(SaveFile& save) {
+    InjectorResult result{};
+
+    if (!save.isLoaded()) {
+        result.message = "Save file not loaded";
+        return result;
+    }
+
+    struct NullSpec {
+        uint32_t key;
+        size_t size;
+    };
+    static const NullSpec specs[] = {
+        { KEY_RAID_IDENTIFIER,     SIZE_RAID_IDENTIFIER },
+        { KEY_RAID_ENEMY_ARRAY,    SIZE_RAID_ENEMY_ARRAY },
+        { KEY_FIXED_REWARD_ARRAY,  SIZE_FIXED_REWARD_ARRAY },
+        { KEY_LOTTERY_REWARD_ARRAY, SIZE_LOTTERY_REWARD_ARRAY },
+        { KEY_RAID_PRIORITY_ARRAY, SIZE_RAID_PRIORITY_ARRAY },
+    };
+
+    for (const auto& spec : specs) {
+        std::vector<uint8_t> nullData(spec.size, 0);
+        if (!save.replaceBlockData(spec.key, nullData)) {
+            result.message = "Failed to clear raid block";
+            return result;
+        }
+    }
+
+    result.success = true;
+    result.identifier = "Null";
+    result.message = "Successfully cleared raid event data";
+    return result;
+}
+
+InjectorResult injectNullOutbreakEvent(SaveFile& save) {
+    InjectorResult result{};
+
+    if (!save.isLoaded()) {
+        result.message = "Save file not loaded";
+        return result;
+    }
+
+    struct NullSpec {
+        uint32_t key;
+        size_t size;
+    };
+    static const NullSpec specs[] = {
+        { KEY_OUTBREAK_POKEDATA,        SIZE_OUTBREAK_POKEDATA       },
+        { KEY_OUTBREAK_ZONES_PALDEA,    SIZE_OUTBREAK_ZONES_PALDEA   },
+        { KEY_OUTBREAK_ZONES_KITAKAMI,  SIZE_OUTBREAK_ZONES_KITAKAMI },
+        { KEY_OUTBREAK_ZONES_BLUEBERRY, SIZE_OUTBREAK_ZONES_BLUEBERRY },
+    };
+
+    for (const auto& spec : specs) {
+        SCBlock* block = save.findBlock(spec.key);
+        if (!block || block->type == SCTypeCode::None)
+            continue;
+
+        std::vector<uint8_t> nullData(spec.size, 0);
+        if (!save.replaceBlockData(spec.key, nullData)) {
+            result.message = "Failed to clear outbreak block";
+            return result;
+        }
+    }
+
+    // Match Tera-Finder's "000 Null Outbreak Event" behavior: BCAT stays
+    // enabled, payload is zeroed.
+    SCBlock* enabled = save.findBlock(KEY_OUTBREAK_ENABLED);
+    if (enabled && enabled->type != SCTypeCode::None) {
+        if (!save.setBoolBlock(KEY_OUTBREAK_ENABLED, true)) {
+            result.message = "Failed to enable outbreak event flag";
+            return result;
+        }
+    }
+
+    result.success = true;
+    result.identifier = "Null";
+    result.message = "Successfully cleared outbreak event data";
+    return result;
+}
+
+InjectorResult resetSevenStarCaptures(SaveFile& save) {
+    InjectorResult result{};
+
+    if (!save.isLoaded()) {
+        result.message = "Save file not loaded";
+        return result;
+    }
+
+    SCBlock* block = save.findBlock(KEY_SEVEN_STAR_CAPTURE);
+    if (!block || block->type == SCTypeCode::None || block->data.empty()) {
+        // No 7-star capture history in this save: nothing to do. Not an error.
+        result.success = true;
+        result.count = 0;
+        result.message = "No 7-Star raid captures to reset";
+        return result;
+    }
+
+    // Read-modify-write: clear the captured byte of each 8-byte record.
+    std::vector<uint8_t> data = block->data;
+    int cleared = 0;
+    for (size_t i = 0; i + SEVEN_STAR_RECORD_SIZE <= data.size(); i += SEVEN_STAR_RECORD_SIZE) {
+        uint8_t& captured = data[i + SEVEN_STAR_OFFSET_CAPTURED];
+        if (captured != 0) {
+            captured = 0;   // leave the defeated flag (offset 0x05) untouched
+            ++cleared;
+        }
+    }
+
+    if (cleared == 0) {
+        result.success = true;
+        result.count = 0;
+        result.message = "No captured 7-Star raids found to reset";
+        return result;
+    }
+
+    if (!save.replaceBlockData(KEY_SEVEN_STAR_CAPTURE, data)) {
+        result.message = "Failed to write 7-Star raid capture block";
+        return result;
+    }
+
+    result.success = true;
+    result.count = cleared;
+    result.message = "Reset " + std::to_string(cleared) + " 7-Star raid capture(s)";
+    return result;
+}
+
+} // namespace Injector
