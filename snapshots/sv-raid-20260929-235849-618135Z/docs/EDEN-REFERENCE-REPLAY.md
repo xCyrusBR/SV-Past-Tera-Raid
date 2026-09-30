@@ -1,0 +1,77 @@
+# Replay da sessão Eden↔Eden
+
+Atualizado em 28/09/2026. Este documento registra como a sessão funcional de dois Edens foi
+transformada em uma referência executável para o host sintético.
+
+## Referência observada
+
+- Captura: `lab/eden-two-client-raid-20260926.jsonl`
+- Decodificação corrigida: `lab/eden-two-client-raid-decoded-pia0.jsonl`
+- Resultado visual: host e `RaidGuest` no lobby, ambos Ready e cena da raid carregada.
+- Abertura LDN: um participante no anúncio; depois da entrada, dois nós e dois jogadores.
+- Port 2 real: o guest envia type 3 e o host responde type 9. Não existe type 7 nessa abertura.
+
+## Diferenças encontradas no host sintético anterior
+
+1. O replay terminava no registro host `0x80:0` sequência 70; a sessão real continua até 219.
+2. Os registros 52/53 e 69/70 são fragmentos. O replay antigo convertia cada fragmento em uma
+   mensagem completa, removendo os bits Start/Middle/End observados.
+3. Uma decodificação antiga aparentava deixar lacunas após registros grandes. Auditoria posterior
+   mostrou que eram mensagens reais com cabeçalho Pia `0x00` herdado, não lacunas deliberadas.
+   A captura redescodificada contém todas as sequências `44..219`.
+4. O A/B 6149 removeu o type 7 porque ele não aparece isoladamente na raid Eden real. O Violet
+   completou Pia e type 9, mas permaneceu em `Communicating`. Isso demonstra que o game-host real
+   fornece estado equivalente por outra via. Auditoria posterior mostrou que esse teste ainda
+   retransmitia IDs antigos dentro do `type 6` comprimido; portanto não prova que o anúncio
+   `type 7` continue necessário após corrigir o `type 6`. O A/B `7284`, com os dois IDs atuais
+   do host, confirmou entrada no lobby sem `type 7`; a associação dos Pokémon, contudo,
+   permaneceu cruzada. A referência funcional dos dois Eden usou Pokémon idênticos, então uma
+   captura com seleções diferentes será necessária para discriminar o mapeamento.
+5. Um primeiro A/B tentou devolver ao Violet seus broadcasts `0x80:0`/`0x81:1`, mas a captura
+   provou que o Eden entrega os registros do guest somente ao host, não ao próprio guest. Esse
+   loopback deixou o Violet preso em `Communicating` e foi removido.
+
+## Limite observado no replay antigo (análise posterior)
+
+Na captura Eden funcional, o convidado confirmou `0x80:0` até ACK 220. Na tentativa física
+Ready-gated `6418`, o host sintético enviou os registros programados até a sequência 219, mas
+o ACK contínuo do Violet parou em 71, embora a máscara tenha sinalizado recebimentos posteriores;
+o menu de golpes não abriu. A aparente lacuna 71–84 era causada pelo decodificador: ele tratava
+o cabeçalho Pia `0x00` como fim do pacote, mas esse cabeçalho herda tamanho/rota e precede
+justamente os fragmentos 71–84. Isso explica de forma concreta por que o replay antigo nunca
+enviou esses fragmentos e é consistente com o Violet ficar em ACK 71, enquanto o Eden funcional
+confirmou 85. O decodificador Pia6 agora
+lê essas mensagens; a captura privada redescodificada contém 176 sequências distintas `44..219`
+e 179 transmissões incluindo retransmissões. O replay corrigido passou nos testes locais, mas
+**ainda não foi testado no Violet**. Não acrescentar dados arbitrários nem desconectar o host
+antes de validar timer e menu de golpes.
+
+## Implementação
+
+- `tools/sv_raid_host.py` agora deriva da captura todos os registros host 44–219.
+- São 179 transmissões na captura corrigida (176 sequências distintas e três retransmissões),
+  mantendo a temporização relativa. O replay antigo omitira 84 mensagens por erro de decodificação.
+- `pokeldn/sv/streams.py` ganhou o marcador `:middle`, para continuações sem Start nem End.
+- O A/B 3861 provou que o primeiro PK9 de `0x80332f` é o Pokémon local do destinatário: ao
+  colocar Mew ali, o Violet físico entrou na cena como Mew. Agora PR/Mew fica no anúncio de
+  lobby `0x80332e`, enquanto o `0x80332f` recebe dinamicamente o PK9 selecionado pelo Violet.
+- O Mewtwo da referência permanece intacto.
+- Os testes 4682 e 6149 confirmaram LDN, Pia, type 3 e type 9, mas isolaram duas regressões:
+  loopback do guest e remoção do type 7. O próximo A/B preserva o caminho de admissão conhecido
+  (`announce`) e somente muda o replay posterior. Deve confirmar, nesta ordem: nome PR/Mew,
+  treinador físico/Pokémon escolhido,
+  cronômetro correndo, cena carregada e menu de golpes.
+
+## Validação local
+
+- `python -m py_compile` passou nos arquivos alterados.
+- `python -m unittest discover -s tests -q`: 14 testes, todos passaram.
+- ROM e update 4.0.0 não foram necessários nesta etapa: a captura funcional fornece evidência
+  mais direta do wire protocol. Eles ficam reservados para identificar campos que ainda permaneçam
+  opacos depois do próximo teste A/B.
+
+## Integridade
+
+- `tools/sv_raid_host.py`: `D073248D9156D32A71E41D3DB642430D69CD4C009E7E01A6007BD83EFE926CEB`
+- `tests/test_sv_raid_host.py`: `3C9AC002D4F83F8883315EF97D6E56729139B2AC0D839E4A0978D955E8BA0BC4`
+- `../pokeldn-research/pokeldn/sv/streams.py`: `E23DA324B8C836FABA2ACC6EEF50D737B88A4F2CF1B6368A7145918992651410`
