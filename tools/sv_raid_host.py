@@ -22,12 +22,11 @@ SV_HOST = POKELDN / "bin" / "sv_host.py"
 DEFAULT_KEYS = Path.home() / ".switch" / "prod.keys"
 LAB_KEYS = ROOT / "lab" / "eden-participant" / "user" / "keys" / "prod.keys"
 DEFAULT_RECORD_SET = ROOT / "lab" / "mewtwo-host-records"
-DEFAULT_REFERENCE_CAPTURE = ROOT / "lab" / "eden-two-client-raid-decoded.jsonl"
+DEFAULT_REFERENCE_CAPTURE = ROOT / "lab" / "eden-two-client-raid-decoded-pia0.jsonl"
 LOBBY_STATE_DELAY = 3.20
 LOBBY_TIMING_SHIFT = LOBBY_STATE_DELAY - 2.00
-# In the working Eden pair the host publishes Session update 0 immediately, then update 1 at
-# +49.105 s: 1.05 s before the fragmented 0x80332f battle-start record.  The late update is the
-# roster commit.  Publishing only update 1 at join time left Violet with invisible fallback NPCs.
+# In the working Eden battle the host publishes Session update 0 immediately, then update 1
+# at +49.105 s, shortly before 0x80332f. The separate no-Ready Eden lobby has only update 0.
 SESSION_ROSTER_COMMIT_DELAY = 49.05
 DEFAULT_MEW = Path(os.environ.get("SV_RAID_MEW", ROOT / "lab" / "host-mew.pk9"))
 
@@ -59,8 +58,31 @@ def raid_countdown_sends(count: int = 39) -> tuple[str, ...]:
     return tuple(sends)
 
 
+def opening_sends(match_eden_order: bool = False,
+                  match_eden_lowest_pending: bool = False) -> tuple[str, ...]:
+    """Optionally match the Eden opening order and sender reliable window."""
+    result = list(RAID_OPENING_SENDS)
+    if match_eden_order:
+        marker = "3.20:0x80:0:803330"
+        matches = [index for index, spec in enumerate(result) if spec.startswith(marker)]
+        if len(matches) != 1:
+            raise RuntimeError("expected exactly one initial 803330 lobby countdown")
+        index = matches[0]
+        result[index] = "3.36" + result[index][4:]
+    if match_eden_lowest_pending:
+        # Functional Eden sends opening 0x80:0 sequences 1/2/3 with the same oldest
+        # pending sequence (1). The replay default incorrectly sets low=seq for 2/3.
+        for marker in ("3.28:0x80:0:80332d", "3.32:0x80:0:80332e"):
+            matches = [index for index, spec in enumerate(result) if spec.startswith(marker)]
+            if len(matches) != 1:
+                raise RuntimeError(f"expected exactly one {marker} opening record")
+            index = matches[0]
+            result[index] += ":low=1"
+    return tuple(result)
+
+
 def patch_host_trainer_announce(spec: str, pokemon_module, mew: Path) -> str:
-    """Replace the captured host's selected and battle Pokemon with PR's Mew."""
+    """Replace only the captured host's lobby selection with PR's Mew."""
     delay, protocol, port, raw = spec.split(":", 3)
     if protocol == "skip":
         return spec
@@ -118,11 +140,9 @@ def raid_reference_sends(capture: Path = DEFAULT_REFERENCE_CAPTURE,
                          first: int = 44, last: int = 219) -> tuple[str, ...]:
     """Replay the complete successful Eden host transition with exact stream boundaries.
 
-    The old implementation stopped at sequence 70 and flattened fragmented records 52/53 and
-    69/70 into independent complete messages.  The working Eden session continues through 219
-    and deliberately leaves sequence gaps after large state records.  Both details are observable
-    receiver state, so this routine preserves flags, gaps and timing from the first occurrence of
-    every host record while ignoring retransmissions.
+    The old decoder stopped at inherited Pia message headers 0x00 and incorrectly inferred
+    gaps after records such as 69/70. The corrected capture contains every sequence 44..219;
+    preserve its fragments, retransmissions, and timing rather than inventing skips.
     """
     found: list[tuple[float, int, int, str, tuple[str, ...]]] = []
     seen: set[tuple[int, int, str, tuple[str, ...]]] = set()
@@ -190,13 +210,51 @@ def parser() -> argparse.ArgumentParser:
                     help="captured host identity/state records; empty disables them")
     ap.add_argument("--lobby-only", action="store_true",
                     help="send only the opening lobby state; do not replay ready/start/battle state")
+    ap.add_argument("--correct-raid-start-roster", action="store_true",
+                    help="diagnostic: decode the LZ4 battle roster and independently put "
+                         "PR's Mew in seat 0 and the guest's selection in seat 1")
+    ap.add_argument("--preserve-guest-session-player", action="store_true",
+                    help="diagnostic: echo the guest's actual Session PlayerInfo into the "
+                         "station list, matching the distinct-save Eden control")
+    ap.add_argument("--match-eden-net-property-body", action="store_true",
+                    help="diagnostic: change only Net 0x50 body byte 27 from 4 to Eden's 7")
+    ap.add_argument("--match-eden-raid-admission", action="store_true",
+                    help="diagnostic: publish type-9 host/0 then guest/1 as in both working raids")
+    ap.add_argument("--raid-reliable-retry", action="store_true",
+                    help="diagnostic: retry missing battle fragments based on guest ACKs")
+    ap.add_argument("--start-on-ready", action="store_true",
+                    help="begin the host transition 0.1 s after Ready, keeping relative phase timing")
+    ap.add_argument("--raid-replay-spacing", type=float, default=0.0,
+                    help="diagnostic: minimum seconds between scheduled battle fragments")
+    ap.add_argument("--replay-last-seq", type=int, default=219,
+                    help="diagnostic: stop the host's battle-state replay at this reliable "
+                         "sequence (44..219); default replays the complete reference")
+    ap.add_argument("--guest-selection-gated-opening", action="store_true",
+                    help="diagnostic: send the host's lobby records 0.1 s after the guest's "
+                         "first selected-Pokémon record, preserving their captured order")
+    ap.add_argument("--gate-records-after-guest", action="store_true",
+                    help="diagnostic: send PR's identity record set about 0.08 s after the "
+                         "guest's first kind-1 record, matching both Eden captures")
+    ap.add_argument("--pace-identity-records", action="store_true",
+                    help="diagnostic: distribute the host identity records across roughly the "
+                         "43 ms burst observed in the functional Eden captures")
+    ap.add_argument("--match-eden-opening-order", action="store_true",
+                    help="diagnostic: send 80332c/80332d/80332e before the first 803330 "
+                         "countdown, matching the functional two-Eden sequence order")
+    ap.add_argument("--match-eden-opening-lowest-pending", action="store_true",
+                    help="diagnostic: keep lowest_pending=1 on the 80332d/e opening records "
+                         "as in the functional two-Eden capture")
     ap.add_argument("--no-port2-announce", action="store_true",
-                    help="omit synthetic port-2 type 7 (diagnostic only; Violet then stalls)")
+                    help="omit the synthetic port-2 type 7; Violet joined without it in 7284 "
+                         "after the type-6 host IDs were corrected")
     ap.add_argument("--port2-announce-slot", type=int, choices=(0, 1), default=1,
-                    help="diagnostic slot encoded in the required type-7 announcement")
+                    help="diagnostic slot encoded in the optional type-7 announcement")
     ap.add_argument("--session-seq-base", type=int, choices=(0, 1), default=1,
                     help="Session join/first-update generation; 0 matches the two-Eden capture, "
                          "1 preserves the physical-lobby baseline")
+    ap.add_argument("--session-message-flags", type=int, choices=(0, 1), default=1,
+                    help="Session reply message flags; 0 matches Eden, 1 preserves the "
+                         "physical-lobby baseline")
     ap.add_argument("--omit-session-ack", action="store_true",
                     help="diagnostic only: omit the type-1 Session join ACK absent from the "
                          "working two-Eden capture")
@@ -204,10 +262,22 @@ def parser() -> argparse.ArgumentParser:
     return ap
 
 
+def session_update_mode_args(lobby_only: bool, start_on_ready: bool = False) -> list[str]:
+    """Match the no-Ready Eden lobby without changing the battle transition."""
+    if lobby_only:
+        return ["--no-late-session-update"]
+    if start_on_ready:
+        return ["--raid-ready-gate-after", "42.7", "--raid-ready-lead", "0.1",
+                "--raid-start-on-ready"]
+    return ["--raid-ready-gate-after", "42.7", "--raid-ready-lead", "4.6"]
+
+
 def main() -> int:
     args = parser().parse_args()
     if len(args.code) != 4 or not args.code.isdigit():
         raise SystemExit("--code must contain exactly four decimal digits")
+    if not 44 <= args.replay_last_seq <= 219:
+        raise SystemExit("--replay-last-seq must be between 44 and 219")
     if not SV_HOST.is_file():
         raise SystemExit(f"missing pokeldn host: {SV_HOST}")
     keys = Path(args.keys).expanduser() if args.keys else (
@@ -224,6 +294,11 @@ def main() -> int:
         return 0
 
     os.environ["POKELDN_RADIO"] = f"esp32:{args.port}"
+    # Prefer this checkout's Windows-compatible LDN backend over an older
+    # editable install that may be earlier on the machine-wide sys.path.
+    vendor_ldn = POKELDN / "vendor" / "LDN"
+    if vendor_ldn.is_dir():
+        sys.path.insert(0, str(vendor_ldn))
     namespace = runpy.run_path(str(SV_HOST), run_name="pokeldn_sv_host")
     # sv_host's root check is meaningful on Linux.  Windows has no geteuid and
     # the ESP32 transport does not require process elevation.
@@ -264,6 +339,7 @@ def main() -> int:
         "--session-host-player-name", " ",
         "--session-console-player-id", "a5b9defccd3b551fb249360d27546e03",
         "--session-console-player-name", " ",
+        "--session-flags", str(args.session_message_flags),
         # The working offline host's kind-1 account field is all zero. Do not invent an online
         # account for PR; patch only the trainer ID/name and preserve the captured offline field.
         "--host-account-id", "",
@@ -280,25 +356,46 @@ def main() -> int:
         # generations 0/1 without also changing transport flags, type-1 ACK or game records.
         *session_sequence_args(args.session_seq_base),
         "--update-delay", str(SESSION_ROSTER_COMMIT_DELAY),
-        # The working two-Eden raid sent type 9 accept but no type 7 announce. The standalone
-        # radio host nevertheless needs type 7 to leave Communicating (A/B 2846).
+        # The working two-Eden raid sent type 9 accept but no type 7 announce. Earlier no-type-7
+        # A/B 2846 stalled with stale type-6 IDs; after fixing them, 7284 joined without type 7.
         "--accept-port2-join",
+        "--ack-received-only",
+        "--monotonic-pia-packet-id",
         "--patch-record-identity",
-        # The first PK9 in 0x80332f is local to the receiving player, not the host.  Capture the
-        # Violet's 0x80332e selection and put that Pokemon into the battle-start record.  PR's Mew
-        # remains in the separate host lobby announcement patched above.
+        # Capture Violet's 0x80332e selection. The legacy compressed-offset patch is retained
+        # only as a baseline; --correct-raid-start-roster decodes LZ4 and patches separate
+        # host/guest entries. See RAID-START-LZ4.md for the demonstrated aliasing bug.
         "--patch-raid-pokemon",
     ]
-    if not args.lobby_only:
-        # The reference's first battle-transition record followed the guest's Ready by 4.62 s.
-        # A fixed +42.7 s schedule can otherwise begin *before* a human presses Ready.
-        sys.argv.extend(["--raid-ready-gate-after", "42.7", "--raid-ready-lead", "4.6"])
+    # The first battle-transition record followed Ready by 4.62 s in the Eden reference.
+    # The separate no-Ready lobby had no late Session update. Isolate these modes.
+    sys.argv.extend(session_update_mode_args(args.lobby_only, args.start_on_ready))
+    if args.correct_raid_start_roster:
+        if args.lobby_only:
+            raise SystemExit("--correct-raid-start-roster requires a battle replay")
+        sys.argv.extend(["--raid-host-pokemon", str(args.mew)])
+    if args.preserve_guest_session_player:
+        sys.argv.append("--preserve-guest-session-player")
+    if args.match_eden_net_property_body:
+        sys.argv.append("--match-eden-net-property-body")
+    if args.match_eden_raid_admission:
+        sys.argv.append("--match-eden-raid-admission")
+    if args.raid_reliable_retry:
+        sys.argv.append("--raid-reliable-retry")
+    if args.raid_replay_spacing:
+        if not 0 < args.raid_replay_spacing <= 1:
+            raise SystemExit("--raid-replay-spacing must be greater than 0 and at most 1 second")
+        sys.argv.extend(["--raid-replay-spacing", str(args.raid_replay_spacing)])
+    if args.guest_selection_gated_opening:
+        sys.argv.extend(["--raid-opening-gate-after", str(LOBBY_STATE_DELAY),
+                         "--raid-opening-lead", "0.1"])
     if not args.no_port2_announce:
         sys.argv.extend(["--announce", "--announce-delay", "3.0",
                          "--announce-slot", str(args.port2_announce_slot)])
     if args.omit_session_ack:
         sys.argv.append("--no-session-ack")
-    for spec in RAID_OPENING_SENDS:
+    for spec in opening_sends(args.match_eden_opening_order,
+                              args.match_eden_opening_lowest_pending):
         spec = patch_host_trainer_announce(spec, pokemon_module, args.mew)
         sys.argv.extend(["--send-at", spec])
     # The countdown records are part of a live lobby, not the battle transition.
@@ -306,7 +403,7 @@ def main() -> int:
     for spec in raid_countdown_sends(139 if args.lobby_only else 39):
         sys.argv.extend(["--send-at", spec])
     if not args.lobby_only:
-        for spec in raid_reference_sends():
+        for spec in raid_reference_sends(last=args.replay_last_seq):
             spec = patch_host_trainer_announce(spec, pokemon_module, args.mew)
             sys.argv.extend(["--send-at", spec])
     if args.record_set:
@@ -314,6 +411,10 @@ def main() -> int:
         if not record_set.is_dir():
             raise SystemExit(f"raid record set not found: {record_set}")
         sys.argv.extend(["--record-set", str(record_set), "--record-delay", "0.35"])
+        if args.gate_records_after_guest:
+            sys.argv.extend(["--record-after-guest-kind1", "0.08"])
+        if args.pace_identity_records:
+            sys.argv.extend(["--record-spacing", "0.0003"])
     if args.violet:
         sys.argv.append("--violet")
     return int(namespace["main"]() or 0)

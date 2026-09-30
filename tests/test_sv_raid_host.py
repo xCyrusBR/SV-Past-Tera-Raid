@@ -16,6 +16,111 @@ SPEC.loader.exec_module(raid_host)
 
 
 class RaidReferenceReplayTests(unittest.TestCase):
+    @unittest.skipUnless(raid_host.DEFAULT_REFERENCE_CAPTURE.is_file(),
+                         "private decoded Eden reference capture is not installed")
+    def test_replay_can_stop_before_first_unacknowledged_live_sequence(self):
+        self.assertEqual(219, raid_host.parser().parse_args([]).replay_last_seq)
+        self.assertEqual(65, raid_host.parser().parse_args(
+            ["--replay-last-seq", "65"]).replay_last_seq)
+        sends = raid_host.raid_reference_sends(last=65)
+        sequences = {int(part[4:]) for spec in sends for part in spec.split(":")
+                     if part.startswith("seq=")}
+        self.assertEqual(set(range(44, 66)), sequences)
+
+    def test_lobby_omits_only_late_session_update(self):
+        self.assertEqual(["--no-late-session-update"],
+                         raid_host.session_update_mode_args(True))
+        self.assertEqual(["--raid-ready-gate-after", "42.7",
+                          "--raid-ready-lead", "4.6"],
+                         raid_host.session_update_mode_args(False))
+
+    def test_start_on_ready_is_opt_in_and_lobby_mode_stays_unchanged(self):
+        self.assertFalse(raid_host.parser().parse_args([]).start_on_ready)
+        self.assertEqual(["--raid-ready-gate-after", "42.7", "--raid-ready-lead", "0.1",
+                          "--raid-start-on-ready"], raid_host.session_update_mode_args(False, True))
+        self.assertEqual(["--no-late-session-update"], raid_host.session_update_mode_args(True, True))
+
+    def test_guest_selection_gated_opening_is_opt_in(self):
+        self.assertFalse(raid_host.parser().parse_args([]).guest_selection_gated_opening)
+        self.assertTrue(raid_host.parser().parse_args(
+            ["--guest-selection-gated-opening"]).guest_selection_gated_opening)
+
+    def test_identity_record_gate_is_opt_in(self):
+        self.assertFalse(raid_host.parser().parse_args([]).gate_records_after_guest)
+        self.assertTrue(raid_host.parser().parse_args(
+            ["--gate-records-after-guest"]).gate_records_after_guest)
+
+    def test_identity_record_pacing_is_opt_in(self):
+        self.assertFalse(raid_host.parser().parse_args([]).pace_identity_records)
+        self.assertTrue(raid_host.parser().parse_args(
+            ["--pace-identity-records"]).pace_identity_records)
+
+    def test_eden_opening_order_diagnostic_delays_only_initial_countdown(self):
+        self.assertFalse(raid_host.parser().parse_args([]).match_eden_opening_order)
+        self.assertTrue(raid_host.parser().parse_args(
+            ["--match-eden-opening-order"]).match_eden_opening_order)
+        baseline = raid_host.opening_sends()
+        diagnostic = raid_host.opening_sends(True)
+        self.assertEqual(len(baseline), len(diagnostic))
+        self.assertEqual(baseline[:4], diagnostic[:4])
+        self.assertTrue(baseline[4].startswith("3.20:0x80:0:803330"))
+        self.assertTrue(diagnostic[4].startswith("3.36:0x80:0:803330"))
+        self.assertEqual(baseline[5:], diagnostic[5:])
+
+    def test_eden_opening_lowest_pending_changes_only_two_headers(self):
+        self.assertFalse(raid_host.parser().parse_args([]).match_eden_opening_lowest_pending)
+        self.assertTrue(raid_host.parser().parse_args(
+            ["--match-eden-opening-lowest-pending"]).match_eden_opening_lowest_pending)
+        baseline = raid_host.opening_sends(True)
+        diagnostic = raid_host.opening_sends(True, True)
+        self.assertEqual(len(baseline), len(diagnostic))
+        changed = [index for index, (left, right) in enumerate(zip(baseline, diagnostic))
+                   if left != right]
+        self.assertEqual([6, 7], changed)
+        self.assertEqual([baseline[index] + ":low=1" for index in changed],
+                         [diagnostic[index] for index in changed])
+
+    @unittest.skipUnless(raid_host.SV_HOST.is_file(),
+                         "pokeldn host implementation is not installed")
+    def test_guest_record_ack_does_not_skip_lost_records(self):
+        spec = importlib.util.spec_from_file_location("radio_sv_host", raid_host.SV_HOST)
+        radio_host = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(radio_host)
+        received = set(range(1, 5)) | set(range(7, 19)) | set(range(36, 47))
+        self.assertEqual(18, radio_host.contiguous_record_high(
+            received, skip_record_gaps=True))
+        self.assertEqual(19, radio_host.reliable5.parse_ack_payload(
+            radio_host.build_bulk_ack({1: 18}, 1)[13:])["entries"][1]["ack_id"])
+        self.assertEqual(2, radio_host.contiguous_record_high(
+            received - {3, 4}, skip_record_gaps=True))
+        self.assertEqual(46, radio_host.contiguous_record_high(
+            set(range(1, 5)) | set(range(7, 47)), skip_record_gaps=True))
+        self.assertEqual(4, radio_host.contiguous_record_high({1, 2, 3, 4, 7}))
+
+    @unittest.skipUnless(raid_host.SV_HOST.is_file(),
+                         "pokeldn host implementation is not installed")
+    def test_pia_packet_ids_advance_for_every_host_packet(self):
+        spec = importlib.util.spec_from_file_location("radio_sv_host_ids", raid_host.SV_HOST)
+        radio_host = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(radio_host)
+        ids = radio_host.PiaPacketIdAllocator()
+        self.assertEqual([0, 1, 2, 3], [ids.next() for _ in range(4)])
+        ids.value = 0xFFFF
+        self.assertEqual([0xFFFF, 0], [ids.next() for _ in range(2)])
+
+    @unittest.skipUnless(raid_host.SV_HOST.is_file(),
+                         "pokeldn host implementation is not installed")
+    def test_opening_gate_keeps_only_lobby_port_zero_and_relative_timing(self):
+        spec = importlib.util.spec_from_file_location("radio_sv_host", raid_host.SV_HOST)
+        radio_host = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(radio_host)
+        gate = radio_host.raid_opening_delay
+        self.assertIsNone(gate("0.14:0x7c:2:00", 3.2))
+        self.assertIsNone(gate("3.20:0x81:0:00", 3.2))
+        self.assertIsNone(gate("3.19:0x80:0:00", 3.2))
+        self.assertAlmostEqual(0.0, gate("3.20:0x80:0:00", 3.2))
+        self.assertAlmostEqual(1.0, gate("4.20:0x80:0:00", 3.2))
+
     def test_session_sequence_diagnostic_changes_only_generation(self):
         self.assertEqual(
             ["--join-seq", "1", "--update-first-seq", "1", "--update-seq", "2"],
@@ -31,6 +136,11 @@ class RaidReferenceReplayTests(unittest.TestCase):
     def test_session_ack_diagnostic_is_opt_in(self):
         self.assertFalse(raid_host.parser().parse_args([]).omit_session_ack)
         self.assertTrue(raid_host.parser().parse_args(["--omit-session-ack"]).omit_session_ack)
+
+    def test_session_message_flags_default_and_reference_diagnostic(self):
+        self.assertEqual(1, raid_host.parser().parse_args([]).session_message_flags)
+        self.assertEqual(0, raid_host.parser().parse_args(
+            ["--session-message-flags", "0"]).session_message_flags)
 
     @unittest.skipUnless(raid_host.SV_HOST.is_file(),
                          "pokeldn host implementation is not installed")
@@ -76,6 +186,9 @@ class RaidReferenceReplayTests(unittest.TestCase):
                          "private decoded Eden reference capture is not installed")
     def test_complete_reference_keeps_fragments_retransmissions_and_tail(self):
         sends = raid_host.raid_reference_sends()
+        sequences = {int(item.rsplit(":seq=", 1)[1].split(":", 1)[0]) for item in sends}
+        self.assertEqual(set(range(44, 220)), sequences)
+        self.assertEqual(179, len(sends))
         self.assertTrue(any(":start:seq=" in item for item in sends))
         self.assertTrue(any(":z:middle:seq=" in item for item in sends))
         self.assertTrue(any(":seq=219:low=219" in item for item in sends))
