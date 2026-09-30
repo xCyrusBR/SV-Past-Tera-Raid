@@ -6,7 +6,7 @@ transformada em uma referência executável para o host sintético.
 ## Referência observada
 
 - Captura: `lab/eden-two-client-raid-20260926.jsonl`
-- Decodificação: `lab/eden-two-client-raid-decoded.jsonl`
+- Decodificação corrigida: `lab/eden-two-client-raid-decoded-pia0.jsonl`
 - Resultado visual: host e `RaidGuest` no lobby, ambos Ready e cena da raid carregada.
 - Abertura LDN: um participante no anúncio; depois da entrada, dois nós e dois jogadores.
 - Port 2 real: o guest envia type 3 e o host responde type 9. Não existe type 7 nessa abertura.
@@ -16,22 +16,41 @@ transformada em uma referência executável para o host sintético.
 1. O replay terminava no registro host `0x80:0` sequência 70; a sessão real continua até 219.
 2. Os registros 52/53 e 69/70 são fragmentos. O replay antigo convertia cada fragmento em uma
    mensagem completa, removendo os bits Start/Middle/End observados.
-3. A sessão real deixa lacunas deliberadas na janela reliable após registros grandes. O replay
-   agora consome essas sequências sem inventar payloads.
+3. Uma decodificação antiga aparentava deixar lacunas após registros grandes. Auditoria posterior
+   mostrou que eram mensagens reais com cabeçalho Pia `0x00` herdado, não lacunas deliberadas.
+   A captura redescodificada contém todas as sequências `44..219`.
 4. O A/B 6149 removeu o type 7 porque ele não aparece isoladamente na raid Eden real. O Violet
    completou Pia e type 9, mas permaneceu em `Communicating`. Isso demonstra que o game-host real
    fornece estado equivalente por outra via. Auditoria posterior mostrou que esse teste ainda
    retransmitia IDs antigos dentro do `type 6` comprimido; portanto não prova que o anúncio
-   `type 7` continue necessário após corrigir o `type 6`. O A/B sem `type 7` deve ser repetido
-   somente com os dois IDs atuais do host, quando o usuário voltar aos testes no Switch.
+   `type 7` continue necessário após corrigir o `type 6`. O A/B `7284`, com os dois IDs atuais
+   do host, confirmou entrada no lobby sem `type 7`; a associação dos Pokémon, contudo,
+   permaneceu cruzada. A referência funcional dos dois Eden usou Pokémon idênticos, então uma
+   captura com seleções diferentes será necessária para discriminar o mapeamento.
 5. Um primeiro A/B tentou devolver ao Violet seus broadcasts `0x80:0`/`0x81:1`, mas a captura
    provou que o Eden entrega os registros do guest somente ao host, não ao próprio guest. Esse
    loopback deixou o Violet preso em `Communicating` e foi removido.
 
+## Limite observado no replay antigo (análise posterior)
+
+Na captura Eden funcional, o convidado confirmou `0x80:0` até ACK 220. Na tentativa física
+Ready-gated `6418`, o host sintético enviou os registros programados até a sequência 219, mas
+o ACK contínuo do Violet parou em 71, embora a máscara tenha sinalizado recebimentos posteriores;
+o menu de golpes não abriu. A aparente lacuna 71–84 era causada pelo decodificador: ele tratava
+o cabeçalho Pia `0x00` como fim do pacote, mas esse cabeçalho herda tamanho/rota e precede
+justamente os fragmentos 71–84. Isso explica de forma concreta por que o replay antigo nunca
+enviou esses fragmentos e é consistente com o Violet ficar em ACK 71, enquanto o Eden funcional
+confirmou 85. O decodificador Pia6 agora
+lê essas mensagens; a captura privada redescodificada contém 176 sequências distintas `44..219`
+e 179 transmissões incluindo retransmissões. O replay corrigido passou nos testes locais, mas
+**ainda não foi testado no Violet**. Não acrescentar dados arbitrários nem desconectar o host
+antes de validar timer e menu de golpes.
+
 ## Implementação
 
 - `tools/sv_raid_host.py` agora deriva da captura todos os registros host 44–219.
-- São 92 transmissões reais e 84 avanços de sequência, mantendo a temporização relativa.
+- São 179 transmissões na captura corrigida (176 sequências distintas e três retransmissões),
+  mantendo a temporização relativa. O replay antigo omitira 84 mensagens por erro de decodificação.
 - `pokeldn/sv/streams.py` ganhou o marcador `:middle`, para continuações sem Start nem End.
 - O A/B 3861 provou que o primeiro PK9 de `0x80332f` é o Pokémon local do destinatário: ao
   colocar Mew ali, o Violet físico entrou na cena como Mew. Agora PR/Mew fica no anúncio de
